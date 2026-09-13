@@ -8,10 +8,13 @@
 stage 2 是可選的，缺它就少一部分結果，而不是整條失敗：
 
     只有 stage 1   → 有輪廓，沒有眼睛
-    stage 1 + 2    → 再加上每隻動物的眼睛位置
+    stage 1 + 2    → 再加上每隻動物的眼睛位置，以及湊齊雙眼者的眼距
 
 這樣設計是因為 stage 2 要另外下載 ViTPose 權重，而 stage 1 在一般照片上馬上
 就能跑；只想確認切割品質時不必把眼睛那一段也載進來。
+
+量測（:mod:`kernel.geometry`）不在這個降級表裡：它是純幾何、不吃權重，
+有眼睛就一定算得出來，沒有需要關掉的理由。
 """
 
 from __future__ import annotations
@@ -21,8 +24,9 @@ from pathlib import Path
 
 import numpy as np
 
+from kernel.geometry import measure_interocular
 from kernel.models.base import EyeDetector, Segmenter, validate_image
-from kernel.schemas import Instance
+from kernel.schemas import Instance, MeasurementResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +42,14 @@ class Scene:
     """實際跑了哪些模型，例如 ``"yolo11l-seg+vitpose-plus-base-ap10k"``。
 
     讓每筆結果自己標明它是什麼跑出來的——比對兩次實驗時不必回頭翻設定檔。
+    """
+
+    measurements: MeasurementResult = MeasurementResult()
+    """由 `instances` 上的 keypoint 算出的距離。
+
+    與 `instances` 分開存放，而不是把距離掛回 `Instance` 上：距離是**兩個
+    點之間**的性質，掛在單一物體上只是剛好目前這一種（雙眼間距）兩端都在
+    同一隻動物身上。跨物體的距離進來時無處可掛，屆時再搬就會動到 schema。
     """
 
     source: Path | None = None
@@ -83,5 +95,6 @@ class InterocularCore:
             image_size=(height, width),
             instances=instances,
             model=self.name,
+            measurements=measure_interocular(instances),
             source=source,
         )

@@ -1,21 +1,24 @@
 """每個 stage 一張疊圖，供人工查驗。
 
     output/
-    ├── 000000000285_1_masks.jpg    輪廓疊色 + bbox + 物種標籤
-    └── 000000000285_2_eyes.jpg     疊在 1 之上，加上眼睛位置與分數
+    ├── 000000000285_1_masks.jpg        輪廓疊色 + bbox + 物種標籤
+    ├── 000000000285_2_eyes.jpg         疊在 1 之上，加上眼睛位置與分數
+    └── 000000000285_3_interocular.jpg  疊在 2 之上，加上雙眼連線與像素距離
 
 這條 pipeline 上的失效幾乎都是**靜默**的——不丟例外、數值看起來也合理，
 只是錯的：
 
     stage 1   多邊形柵格化歪掉、錯把背景納入輪廓
     stage 2   關鍵點索引錯位（鼻子被當成眼睛）、側臉時抓到被遮住的那顆眼
+    stage 3   連線跨到隔壁動物身上（keypoint 歸屬配錯）
 
 其中關鍵點索引錯位那次，就是靠肉眼看疊圖才抓到的（見
 :mod:`kernel.models.keypoint` 模組開頭）。所以疊圖在這個專案不是加分項，
 而是主要的除錯手段。
 
-圖是層層疊上去的：stage 2 畫在 stage 1 之上，這樣才看得出「這顆眼睛屬於
-哪一塊輪廓」。同一隻動物在各張圖上顏色固定，方便交叉比對。
+圖是層層疊上去的：stage 2 畫在 stage 1 之上，stage 3 再畫在 2 之上，這樣
+才看得出「這顆眼睛屬於哪一塊輪廓」「這條線連的是不是同一隻動物」。同一隻
+動物在各張圖上顏色固定，方便交叉比對。
 
 所有繪圖都在 **RGB** 空間進行，只有 :func:`save` 會轉成 BGR——cv2 只有在
 編碼寫檔時才在意通道順序。
@@ -30,15 +33,16 @@ import cv2
 import numpy as np
 
 from kernel.core import Scene
-from kernel.visualization.palette import color_for, contrast_color
+from kernel.visualization.palette import MEASUREMENT_COLOR, color_for, contrast_color
 
 MASK_ALPHA = 0.40
 STAGE_FILENAMES = {
     1: "1_masks.jpg",
     2: "2_eyes.jpg",
+    3: "3_interocular.jpg",
 }
 
-ALL_STAGES = (1, 2)
+ALL_STAGES = (1, 2, 3)
 
 
 def render_scene(
@@ -61,6 +65,7 @@ def render_scene(
     renderers = {
         1: draw_masks,
         2: draw_eyes,
+        3: draw_interocular,
     }
 
     written: list[Path] = []
@@ -126,7 +131,9 @@ def draw_masks(
 # -- stage 2：眼睛 ----------------------------------------------------------
 
 
-def draw_eyes(image: np.ndarray, scene: Scene) -> np.ndarray | None:
+def draw_eyes(
+    image: np.ndarray, scene: Scene, label: LabelPlacer | None = None
+) -> np.ndarray | None:
     """在 stage 1 之上標出眼睛。沒有任何眼睛時回傳 None。
 
     疊在輪廓上而不是畫在原圖，是為了讓「這顆眼睛屬於哪隻動物」一眼看得出來
@@ -134,11 +141,13 @@ def draw_eyes(image: np.ndarray, scene: Scene) -> np.ndarray | None:
 
     十字準星的中心是關鍵點的真實子像素位置。畫圓圈的話中心會被圓心取整
     掩蓋掉，而子像素精度直接影響最終的距離誤差。
+
+    `label` 可由上層的 stage 傳入共用，理由同 :func:`draw_masks`。
     """
     if scene.n_eyes == 0:
         return None
 
-    label = LabelPlacer()
+    label = label or LabelPlacer()
     canvas = draw_masks(image, scene, label)
     thickness = _line_thickness(image)
     arm = max(6, int(_scale(image) * 8))
@@ -157,6 +166,56 @@ def draw_eyes(image: np.ndarray, scene: Scene) -> np.ndarray | None:
                 color,
                 image,
             )
+
+    return canvas
+
+
+# -- stage 3：雙眼距離 ------------------------------------------------------
+
+
+def draw_interocular(image: np.ndarray, scene: Scene) -> np.ndarray | None:
+    """在 stage 2 之上連出每隻動物的雙眼，標上像素距離。
+
+    沒有任何量測時回傳 None——只抓到一顆眼睛的動物在這一層本來就不該有線。
+
+    連線與標籤一律是 :data:`~kernel.visualization.palette.MEASUREMENT_COLOR`
+    的藍色，不跟著 instance 的顏色跑：量測是跨越兩個點的東西，用其中一端的
+    顏色畫會讓人以為那條線也屬於某隻動物。
+
+    這一層要查的失效是**連線跨到隔壁動物身上**。線本身既然是統一色，判讀就
+    改看兩端：藍線的兩頭如果落在兩個不同顏色的十字準星上，就是 keypoint 的
+    歸屬配錯了——這種錯只看座標數字幾乎看不出來。標籤裡仍帶著 instance id，
+    對得回是哪一隻。
+
+    距離短到連線被十字準星蓋住是正常的：三公尺外的貓，雙眼間距在畫面上只有
+    個位數像素。數字照樣印在標籤上，那才是這張圖真正要傳達的東西。
+    """
+    if scene.measurements.is_empty:
+        return None
+
+    label = LabelPlacer()
+    canvas = draw_eyes(image, scene, label)
+    thickness = _line_thickness(image)
+
+    for inst in scene.instances:
+        measurement = scene.measurements.for_instance(inst.instance_id)
+        if measurement is None:
+            continue
+
+        # 有量測就代表雙眼俱全，`eyes` 依左右順序回傳。
+        left, right = inst.eyes
+        p1 = (int(round(left.point.u)), int(round(left.point.v)))
+        p2 = (int(round(right.point.u)), int(round(right.point.v)))
+
+        cv2.line(canvas, p1, p2, MEASUREMENT_COLOR, thickness, cv2.LINE_AA)
+        label(
+            canvas,
+            f"#{inst.instance_id} {measurement.distance_px:.1f}px "
+            f"conf={measurement.confidence:.2f}",
+            ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2),
+            MEASUREMENT_COLOR,
+            image,
+        )
 
     return canvas
 

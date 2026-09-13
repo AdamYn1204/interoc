@@ -76,13 +76,17 @@ def format_scene(scene: Scene) -> str:
     height, width = scene.image_size
     lines = [
         f"{name}  {width}x{height}  "
-        f"{scene.n_instances} 隻動物 / {scene.n_eyes} 顆眼睛"
+        f"{scene.n_instances} 隻動物 / {scene.n_eyes} 顆眼睛 / "
+        f"{scene.measurements.total} 組眼距"
     ]
 
     for inst in scene.instances:
         eyes = ", ".join(f"{kp.name}={kp.score:.2f}" for kp in inst.eyes) or "無眼睛"
+        measurement = scene.measurements.for_instance(inst.instance_id)
+        distance = f"  眼距={measurement.distance_px:.1f}px" if measurement else ""
         lines.append(
-            f"  #{inst.instance_id} {inst.label:<9} conf={inst.score:.2f}  {eyes}"
+            f"  #{inst.instance_id} {inst.label:<9} conf={inst.score:.2f}  "
+            f"{eyes}{distance}"
         )
 
     if not scene.instances:
@@ -93,27 +97,40 @@ def format_scene(scene: Scene) -> str:
 
 def scene_to_dict(scene: Scene) -> dict:
     """轉成可序列化的結構。遮罩不進 JSON，太大了；要看輪廓請看疊圖。"""
+
+    def instance_to_dict(inst) -> dict:
+        # 眼距掛在各自的 instance 底下而不是另開一個頂層區塊：這一版的量測
+        # 兩端都在同一隻動物身上，讀 JSON 的人不必自己拿 id 去對照。跨物體
+        # 的距離進來時無處可掛，屆時才需要一個平行的 measurements 區塊。
+        measurement = scene.measurements.for_instance(inst.instance_id)
+        return {
+            "instance_id": inst.instance_id,
+            "label": inst.label,
+            "score": inst.score,
+            "bbox_xyxy": list(inst.bbox.as_xyxy()),
+            "eyes": {
+                kp.name: {
+                    "x": kp.point.u,
+                    "y": kp.point.v,
+                    "score": kp.score,
+                }
+                for kp in inst.eyes
+            },
+            "interocular": (
+                None
+                if measurement is None
+                else {
+                    "distance_px": measurement.distance_px,
+                    "confidence": measurement.confidence,
+                }
+            ),
+        }
+
     return {
         "source": str(scene.source) if scene.source else None,
         "image_size": {"height": scene.image_size[0], "width": scene.image_size[1]},
         "model": scene.model,
-        "instances": [
-            {
-                "instance_id": inst.instance_id,
-                "label": inst.label,
-                "score": inst.score,
-                "bbox_xyxy": list(inst.bbox.as_xyxy()),
-                "eyes": {
-                    kp.name: {
-                        "x": kp.point.u,
-                        "y": kp.point.v,
-                        "score": kp.score,
-                    }
-                    for kp in inst.eyes
-                },
-            }
-            for inst in scene.instances
-        ],
+        "instances": [instance_to_dict(inst) for inst in scene.instances],
     }
 
 
@@ -213,7 +230,11 @@ def main(argv: list[str] | None = None) -> int:
 
     total_instances = sum(s.n_instances for s in scenes)
     total_eyes = sum(s.n_eyes for s in scenes)
-    print(f"合計：{total_instances} 隻動物，{total_eyes} 顆眼睛")
+    total_measured = sum(s.measurements.total for s in scenes)
+    print(
+        f"合計：{total_instances} 隻動物，{total_eyes} 顆眼睛，"
+        f"{total_measured} 組眼距"
+    )
     if outdir:
         print(f"疊圖：{rendered} 張，寫入 {outdir}/")
 
@@ -245,14 +266,18 @@ if __name__ == "__main__":
         ├── results.json                完整結果
         ├── 000000000285_1_masks.jpg
         ├── 000000000285_2_eyes.jpg
+        ├── 000000000285_3_interocular.jpg
         └── 000000020247_1_masks.jpg
 
     預設存檔是刻意的：這條 pipeline 的失效幾乎都是靜默的，跑的當下留下查驗用的
     圖，比事後起疑再回頭重跑一次划算得多。用 ``--outdir`` 換目錄、``--no-save``
     完全關掉。
 
-    預設跑 stage 1 + 2（切割 + 眼睛），輸出每隻動物的輪廓與雙眼位置。
-    ``--no-eyes`` 只跑切割，此時不會產生 2_eyes.jpg。
+    預設跑 stage 1 + 2（切割 + 眼睛），並對雙眼俱全的動物算出**像素**眼距。
+    ``--no-eyes`` 只跑切割，此時不會產生 2_eyes.jpg 與 3_interocular.jpg。
+
+    眼距目前只有像素值，還不是公分——換算成真實尺度需要深度與相機焦距，
+    兩者都還沒進來。
     """
 
     raise SystemExit(main())

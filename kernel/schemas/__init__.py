@@ -4,7 +4,8 @@
 座標系約定死，上層才不必在每個交界重新確認一次格式。這個 package 不做
 任何運算，只定義「資料長什麼樣子」。
 
-目前涵蓋 stage 1（bbox、mask）與 stage 2（keypoint）。
+目前涵蓋 stage 1（bbox、mask）、stage 2（keypoint）與由兩者算出的量測
+（目前只有像素距離）。
 """
 
 from kernel.schemas.frames import CoordinateFrame
@@ -16,6 +17,7 @@ from kernel.schemas.instance import (
     InstanceMask,
     Keypoint,
 )
+from kernel.schemas.measurement import InterocularDistance, MeasurementResult
 from kernel.schemas.points import FrameMismatchError, Point2D
 
 __all__ = [
@@ -26,6 +28,8 @@ __all__ = [
     "FrameMismatchError",
     "Instance",
     "InstanceMask",
+    "InterocularDistance",
     "Keypoint",
+    "MeasurementResult",
     "Point2D",
 ]
