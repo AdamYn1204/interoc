@@ -1,0 +1,11 @@
+[project]
+name = "interoc"
+version = "0.1.0"
+description = "Instance segmentation + keypoint localization + metric depth for 3D eye-distance measurement"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.0",
+    "opencv-python>=4.10",
+    "scipy>=1.18.1",
+]
