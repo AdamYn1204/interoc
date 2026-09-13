@@ -26,14 +26,16 @@ INSTANCE_COLORS: tuple[tuple[int, int, int], ...] = (
 )
 
 
-#: 量測（雙眼連線與距離標籤）專用色，不跟著 instance 跑。
-#:
-#: 刻意用單一顏色：量測是**跨越兩個點**的東西，用其中一端的顏色畫它會讓人
-#: 以為那條線也屬於某隻動物。固定成藍色之後，「藍色 = 這是算出來的，不是
-#: 模型直接吐出來的」在整份輸出裡就是一個一眼可辨的分類。
-#:
-#: 這個藍刻意不在 :data:`INSTANCE_COLORS` 裡面，才不會跟某一隻動物撞色。
-MEASUREMENT_COLOR: tuple[int, int, int] = (0, 120, 255)
+#: 跨物體連線的顏色。刻意用中性白，避免和任一 instance 的顏色混淆——那條線
+#: 不屬於任何一隻動物。同一隻動物的雙眼連線則用該 instance 的顏色，兩者的
+#: 誤差來源完全不同，視覺上必須一眼分得開。
+CROSS_OBJECT_COLOR: tuple[int, int, int] = (255, 255, 255)
+
+#: 深度取樣視窗的框線顏色。
+SAMPLE_WINDOW_COLOR: tuple[int, int, int] = (255, 255, 255)
+
+#: 取樣失敗時的標記顏色。
+FAILURE_COLOR: tuple[int, int, int] = (255, 0, 0)
 
 
 def color_for(instance_id: int) -> tuple[int, int, int]:

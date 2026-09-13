@@ -1,24 +1,26 @@
 """每個 stage 一張疊圖，供人工查驗。
 
     output/
-    ├── 000000000285_1_masks.jpg        輪廓疊色 + bbox + 物種標籤
-    ├── 000000000285_2_eyes.jpg         疊在 1 之上，加上眼睛位置與分數
-    └── 000000000285_3_interocular.jpg  疊在 2 之上，加上雙眼連線與像素距離
+    ├── 000000000285_1_masks.jpg    輪廓疊色 + bbox + 物種標籤
+    ├── 000000000285_2_eyes.jpg     疊在 1 之上，加上眼睛位置與分數
+    ├── 000000000285_3_depth.jpg    深度偽彩圖 + 輪廓 + 取樣視窗
+    └── 000000000285_4_measure.jpg  兩種距離的連線與數字
 
 這條 pipeline 上的失效幾乎都是**靜默**的——不丟例外、數值看起來也合理，
 只是錯的：
 
     stage 1   多邊形柵格化歪掉、錯把背景納入輪廓
     stage 2   關鍵點索引錯位（鼻子被當成眼睛）、側臉時抓到被遮住的那顆眼
-    stage 3   連線跨到隔壁動物身上（keypoint 歸屬配錯）
+    stage 3   取樣視窗跨過輪廓邊界，深度讀到背景
+    stage 4   連線跨到隔壁動物身上（keypoint 歸屬配錯）
 
 其中關鍵點索引錯位那次，就是靠肉眼看疊圖才抓到的（見
 :mod:`kernel.models.keypoint` 模組開頭）。所以疊圖在這個專案不是加分項，
 而是主要的除錯手段。
 
-圖是層層疊上去的：stage 2 畫在 stage 1 之上，stage 3 再畫在 2 之上，這樣
-才看得出「這顆眼睛屬於哪一塊輪廓」「這條線連的是不是同一隻動物」。同一隻
-動物在各張圖上顏色固定，方便交叉比對。
+1 與 2 是層層疊上去的，這樣才看得出「這顆眼睛屬於哪一塊輪廓」。3 換成深度
+偽彩底圖、4 換成調暗的原圖，因為那兩層要看的是別的東西——疊在輪廓上反而
+會被遮住。同一隻動物在各張圖上顏色固定，方便交叉比對。
 
 所有繪圖都在 **RGB** 空間進行，只有 :func:`save` 會轉成 BGR——cv2 只有在
 編碼寫檔時才在意通道順序。
@@ -33,16 +35,29 @@ import cv2
 import numpy as np
 
 from kernel.core import Scene
-from kernel.visualization.palette import MEASUREMENT_COLOR, color_for, contrast_color
+from kernel.geometry import DEPTH_SAMPLE_RADIUS
+from kernel.schemas import LEFT_EYE, RIGHT_EYE, DepthMap, Keypoint
+from kernel.visualization.palette import (
+    CROSS_OBJECT_COLOR,
+    FAILURE_COLOR,
+    SAMPLE_WINDOW_COLOR,
+    color_for,
+    contrast_color,
+)
 
 MASK_ALPHA = 0.40
+
+#: stage 4 底圖調暗的比例。不調暗的話，細線和數字會被原圖的細節吃掉。
+DIM_FACTOR = 0.55
+
 STAGE_FILENAMES = {
     1: "1_masks.jpg",
     2: "2_eyes.jpg",
-    3: "3_interocular.jpg",
+    3: "3_depth.jpg",
+    4: "4_measure.jpg",
 }
 
-ALL_STAGES = (1, 2, 3)
+ALL_STAGES = (1, 2, 3, 4)
 
 
 def render_scene(
@@ -65,7 +80,8 @@ def render_scene(
     renderers = {
         1: draw_masks,
         2: draw_eyes,
-        3: draw_interocular,
+        3: draw_depth,
+        4: draw_measurements,
     }
 
     written: list[Path] = []
@@ -170,54 +186,185 @@ def draw_eyes(
     return canvas
 
 
-# -- stage 3：雙眼距離 ------------------------------------------------------
+# -- stage 3：深度 ----------------------------------------------------------
 
 
-def draw_interocular(image: np.ndarray, scene: Scene) -> np.ndarray | None:
-    """在 stage 2 之上連出每隻動物的雙眼，標上像素距離。
+def draw_depth(image: np.ndarray, scene: Scene) -> np.ndarray | None:
+    """深度圖上色，並畫出每顆眼睛的**取樣視窗**。沒跑 stage 3 時回傳 None。
 
-    沒有任何量測時回傳 None——只抓到一顆眼睛的動物在這一層本來就不該有線。
+    畫取樣視窗是這張圖的重點，不是附帶資訊。深度取樣讀到背景是整條 pipeline
+    最難察覺的失效：眼睛靠近輪廓邊緣，視窗必然會蓋到背景，而單目深度在邊界
+    又最不穩。旁邊的 ``c=`` 直接告訴你視窗內的深度有多一致——低於 0.5 就代表
+    那個視窗裡有兩群差很多的深度值，量出來的數字不能信。
 
-    連線與標籤一律是 :data:`~kernel.visualization.palette.MEASUREMENT_COLOR`
-    的藍色，不跟著 instance 的顏色跑：量測是跨越兩個點的東西，用其中一端的
-    顏色畫會讓人以為那條線也屬於某隻動物。
+    instance 輪廓也畫在深度圖上。少了它，這張圖就回答不了它唯一要回答的
+    問題：取樣視窗到底有沒有跨過物體邊界。深度圖本身是看不出動物在哪的。
+    """
+    if scene.depth is None:
+        return None
 
-    這一層要查的失效是**連線跨到隔壁動物身上**。線本身既然是統一色，判讀就
-    改看兩端：藍線的兩頭如果落在兩個不同顏色的十字準星上，就是 keypoint 的
-    歸屬配錯了——這種錯只看座標數字幾乎看不出來。標籤裡仍帶著 instance id，
-    對得回是哪一隻。
+    label = LabelPlacer()
+    canvas = _colorize_depth(scene.depth)
+    thickness = _line_thickness(image)
 
-    距離短到連線被十字準星蓋住是正常的：三公尺外的貓，雙眼間距在畫面上只有
-    個位數像素。數字照樣印在標籤上，那才是這張圖真正要傳達的東西。
+    for inst in scene.instances:
+        if inst.mask is None:
+            continue
+        contours, _ = cv2.findContours(
+            inst.mask.data.astype(np.uint8),
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        cv2.drawContours(
+            canvas, contours, -1, color_for(inst.instance_id), max(1, thickness - 1)
+        )
+
+    for inst in scene.instances:
+        for kp in inst.eyes:
+            u, v = _xy(kp)
+            r = DEPTH_SAMPLE_RADIUS
+            color = SAMPLE_WINDOW_COLOR if kp.has_depth else FAILURE_COLOR
+            cv2.rectangle(
+                canvas, (u - r, v - r), (u + r, v + r), color, max(1, thickness - 1)
+            )
+            text = (
+                f"#{inst.instance_id} {kp.depth:.2f}m c={kp.depth_confidence:.2f}"
+                if kp.has_depth
+                else f"#{inst.instance_id} no depth"
+            )
+            label(canvas, text, (u + r, v - r), color, image)
+
+    return canvas
+
+
+def _colorize_depth(depth_map: DepthMap) -> np.ndarray:
+    """把公尺值轉成可看的偽彩圖。
+
+    正規化用 2/98 百分位而不是最小/最大值：天空或反光面常有極端值，用極值
+    正規化會把整個動物壓成同一個色調，那張圖就什麼也看不出來。
+    """
+    valid = depth_map.validity()
+    data = depth_map.data
+
+    if not valid.any():
+        return np.zeros((*depth_map.shape, 3), dtype=np.uint8)
+
+    lo, hi = np.percentile(data[valid], (2, 98))
+    if hi <= lo:
+        hi = lo + 1e-6
+
+    normalized = np.clip((data - lo) / (hi - lo), 0.0, 1.0)
+    gray = (normalized * 255).astype(np.uint8)
+    colored = np.ascontiguousarray(cv2.applyColorMap(gray, cv2.COLORMAP_TURBO)[:, :, ::-1])
+
+    # 無效像素塗黑，才不會被誤讀成「很近」
+    colored[~valid] = 0
+    return colored
+
+
+# -- stage 4：量測 ----------------------------------------------------------
+
+
+def draw_measurements(image: np.ndarray, scene: Scene) -> np.ndarray | None:
+    """畫出兩種距離：同一隻動物的雙眼連線，以及跨動物的眼對眼連線。
+
+    沒有任何量測時回傳 None。
+
+    底圖調暗，讓連線與數字讀得出來。雙眼連線用該動物的顏色、跨物體連線用
+    白色虛線——兩者的誤差來源完全不同（前者由 keypoint 定位主導，後者由
+    深度主導），視覺上必須一眼分得開。中性的白色留給跨物體，因為那條線
+    不屬於任何一隻動物。
+
+    這一層要查的失效是連線跨到隔壁動物身上：實線的兩端如果落在兩塊不同
+    顏色的輪廓上，就是 keypoint 歸屬配錯了。
     """
     if scene.measurements.is_empty:
         return None
 
     label = LabelPlacer()
-    canvas = draw_eyes(image, scene, label)
+    canvas = (image * DIM_FACTOR).astype(np.uint8)
     thickness = _line_thickness(image)
+    by_id = {inst.instance_id: inst for inst in scene.instances}
 
-    for inst in scene.instances:
-        measurement = scene.measurements.for_instance(inst.instance_id)
-        if measurement is None:
+    for d in scene.measurements.interocular:
+        inst = by_id.get(d.instance_id)
+        if inst is None:
             continue
-
-        # 有量測就代表雙眼俱全，`eyes` 依左右順序回傳。
-        left, right = inst.eyes
-        p1 = (int(round(left.point.u)), int(round(left.point.v)))
-        p2 = (int(round(right.point.u)), int(round(right.point.v)))
-
-        cv2.line(canvas, p1, p2, MEASUREMENT_COLOR, thickness, cv2.LINE_AA)
+        left, right = inst.keypoint(LEFT_EYE), inst.keypoint(RIGHT_EYE)
+        if left is None or right is None:
+            continue
+        color = color_for(d.instance_id)
+        p, q = _xy(left), _xy(right)
+        cv2.line(canvas, p, q, color, thickness + 1, cv2.LINE_AA)
         label(
             canvas,
-            f"#{inst.instance_id} {measurement.distance_px:.1f}px "
-            f"conf={measurement.confidence:.2f}",
-            ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2),
-            MEASUREMENT_COLOR,
+            f"#{d.instance_id} {d.label} {_distance_text(d)}",
+            _midpoint(p, q),
+            color,
+            image,
+        )
+
+    for d in scene.measurements.inter_object:
+        a, b = by_id.get(d.instance_a), by_id.get(d.instance_b)
+        if a is None or b is None:
+            continue
+        kp_a, kp_b = a.keypoint(d.keypoint_a), b.keypoint(d.keypoint_b)
+        if kp_a is None or kp_b is None:
+            continue
+        p, q = _xy(kp_a), _xy(kp_b)
+        _dashed_line(canvas, p, q, CROSS_OBJECT_COLOR, thickness)
+        # dz 遠大於零時，這筆量的其實是「深度差」而不是橫向距離，誤差會由
+        # 深度模型主導。診斷離群值時先看這一欄。
+        gap = "" if d.depth_gap_m is None else f" dz={d.depth_gap_m:.2f}m"
+        label(
+            canvas,
+            f"#{d.instance_a}-#{d.instance_b} {d.label_a}/{d.label_b} "
+            f"{_distance_text(d)}{gap}",
+            _midpoint(p, q),
+            CROSS_OBJECT_COLOR,
             image,
         )
 
     return canvas
+
+
+def _distance_text(measurement) -> str:
+    """像素距離一定有，公尺距離則看有沒有跑 stage 3。"""
+    parts = []
+    if measurement.distance_px is not None:
+        parts.append(f"{measurement.distance_px:.0f}px")
+    if measurement.distance_m is not None:
+        parts.append(f"{measurement.distance_m:.2f}m")
+    parts.append(f"c={measurement.confidence:.2f}")
+    return " ".join(parts)
+
+
+def _xy(keypoint: Keypoint) -> tuple[int, int]:
+    return (int(round(keypoint.point.u)), int(round(keypoint.point.v)))
+
+
+def _midpoint(p: tuple[int, int], q: tuple[int, int]) -> tuple[int, int]:
+    return ((p[0] + q[0]) // 2, (p[1] + q[1]) // 2)
+
+
+def _dashed_line(
+    canvas: np.ndarray,
+    p: tuple[int, int],
+    q: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int,
+    dash: int = 12,
+) -> None:
+    """cv2 沒有虛線，自己沿線段切段畫。"""
+    length = int(np.hypot(q[0] - p[0], q[1] - p[1]))
+    if length == 0:
+        return
+    steps = max(1, length // dash)
+    for i in range(0, steps, 2):
+        t0, t1 = i / steps, min((i + 1) / steps, 1.0)
+        a = (int(p[0] + (q[0] - p[0]) * t0), int(p[1] + (q[1] - p[1]) * t0))
+        b = (int(p[0] + (q[0] - p[0]) * t1), int(p[1] + (q[1] - p[1]) * t1))
+        cv2.line(canvas, a, b, color, thickness, cv2.LINE_AA)
 
 
 # -- 繪圖小工具 -------------------------------------------------------------

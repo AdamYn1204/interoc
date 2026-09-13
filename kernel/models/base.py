@@ -11,7 +11,7 @@ from typing import Protocol, Sequence, runtime_checkable
 import numpy as np
 import torch
 
-from kernel.schemas import Instance
+from kernel.schemas import DepthMap, Instance
 
 
 def validate_image(image: np.ndarray) -> np.ndarray:
@@ -82,5 +82,34 @@ class EyeDetector(Protocol):
         的，這個資訊不應該在回傳時被攤平掉；一旦攤平就只能靠框中心距離
         重新猜，而兩隻動物的框一重疊就會猜錯（眼睛在框的頂端，比的卻是框
         中心，體型大的那隻會把鄰居的眼睛整組搶走）。
+        """
+        ...
+
+
+@runtime_checkable
+class DepthEstimator(Protocol):
+    """Stage 3：估計每像素的深度。"""
+
+    name: str
+
+    estimates_focal: bool
+    """這個模型會不會自己估出焦距。
+
+    決定了「沒給 focal 時能不能跑」：不會估的模型少了焦距就反投影不了，
+    應該在建構 pipeline 當下就報錯，而不是跑完一整輪才發現沒有公尺數。
+    """
+
+    def estimate(self, image: np.ndarray, focal_px: float | None) -> DepthMap:
+        """回傳與輸入影像同尺寸的深度圖，焦距一併掛在 `DepthMap.focal_px`。
+
+        `focal_px` 是呼叫端已知的水平焦距（像素），**語義是覆寫**：
+
+        * 給了 → 用它，並據以修正模型的尺度（會估焦距的模型，其絕對尺度
+          正比於焦距，換一個焦距就要等比例重算深度）。
+        * 沒給 → 由模型自己估（`estimates_focal` 為真時），或回傳 None 焦距
+          的深度圖，此時下游只能走像素路徑。
+
+        回傳的 `DepthMap.is_metric` 必須誠實：拿相對深度去冒充公尺，下游的
+        距離看起來完全正常但毫無物理意義。
         """
         ...

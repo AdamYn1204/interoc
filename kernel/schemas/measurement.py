@@ -1,35 +1,35 @@
 """最終量測輸出。
 
-目前只有一種距離：:class:`InterocularDistance`——同一隻動物左右眼之間的
-間距，每隻各一組。跨動物的眼對眼距離要等 depth 階段進來才有意義，屆時
-另開一個型別，不要把兩者塞進同一個「兩點距離」：同一隻動物的兩顆眼睛
-深度幾乎相同，誤差主要來自 keypoint 定位；跨物體的兩顆眼睛則可能差好幾
-公尺，誤差由深度主導。混在一起會讓評測數字失去意義。
+這條 pipeline 對外承諾兩種距離，兩者都是 KPI：
 
-為什麼像素距離值得單獨存在
---------------------------
-`distance_px` 不需要深度、也不需要相機內參，只要兩顆眼睛都定位成功就一定
-算得出來。之後 metric 路徑上線了它也會保留：深度無效或焦距未知時它是唯一
-還能回報的數字，同時也是驗證公尺數的對照組。
+1. :class:`InterocularDistance` —— 同一隻動物的左右眼間距，每隻各一組。
+2. :class:`InterObjectEyeDistance` —— 不同動物的眼睛之間的距離（預設為
+   右眼對右眼），N 隻有眼睛的動物共 N(N-1)/2 組。
 
-這個型別刻意不預留 `distance_m` 之類的 None 欄位。留了的話下游會寫出
-「先讀 distance_m、是 None 再退回 distance_px」的分支，而在 depth 進來
-之前那個分支永遠走後者——一段從來沒被執行過的程式碼，等到真的有深度了
-也不會有人記得它需要驗證。等那個階段到了再加，屆時型別會直接告訴你哪些
-呼叫端需要修改。
+兩者的誤差來源不同，所以刻意分成兩個型別而不是共用一個「兩點距離」：
+同一隻動物的兩顆眼睛深度幾乎相同，橫向分量主導，誤差主要來自 keypoint
+定位；跨物體的兩顆眼睛則可能差好幾公尺，誤差由深度主導。混在一起會讓
+評測數字失去意義——一個 5% 的整體誤差，在前者是「還行」，在後者可能代表
+深度模型根本沒抓到其中一隻。
+
+`distance_px` 兩者都保留。它不需要深度、不需要內參，只要眼睛定位成功就
+一定算得出來，所以在 metric 路徑失敗時（深度無效、焦距未知、模型吐的是
+相對深度）它是唯一還能回報的數字。它同時也是驗證 metric 結果的對照組：
+:attr:`InterocularDistance.meters_per_pixel` 就是拿來做那個對照的。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+from kernel.schemas.points import Point3D
+
 
 @dataclass(frozen=True, slots=True)
 class InterocularDistance:
-    """單一動物左右眼之間的像素距離。
+    """單一動物左右眼之間的距離。
 
-    每隻動物最多一組——牠只有一對眼睛。只定位到一顆眼睛的動物不會產生
-    這個型別的實例（見 :func:`kernel.geometry.measure_interocular`）。
+    內部一律以公尺儲存，只在展示或報表邊界換算成 mm / cm。
     """
 
     instance_id: int
@@ -41,27 +41,145 @@ class InterocularDistance:
     類別，必須單獨列，不能混進總體平均。
     """
 
-    distance_px: float
-    """兩眼在**原圖**座標上的歐氏距離，單位為像素。
+    confidence: float
+    """0..1，由兩顆眼睛的定位信心與深度取樣信心合成。
+
+    合成公式屬於 geometry 層，這個欄位只負責攜帶結果。低信心的量測不應該
+    被靜靜丟掉，而是照常輸出並讓呼叫端自行設門檻——「這次量不準」本身
+    就是重要資訊。
+    """
+
+    distance_px: float | None = None
+    """兩眼在原圖上的像素距離，不依賴深度與內參。
 
     保留小數。keypoint 是子像素精度的，而這個距離本身可能只有個位數像素
-    （3 公尺外的貓，雙眼間距在畫面上約 7 px），四捨五入掉的量級跟訊號
+    （三公尺外的貓，雙眼間距在畫面上約 7 px），四捨五入掉的量級跟訊號
     本身同級。
     """
 
-    confidence: float
-    """0..1，目前為兩顆眼睛定位信心中**較低**的那個。
+    distance_m: float | None = None
+    """三維距離（公尺）。沒跑深度階段、或深度取樣失敗時為 None。"""
 
-    取較低者而非平均：一組量測的好壞由較差的那個端點決定。取平均會讓
-    「一顆 0.90、一顆 0.31」看起來像 0.60，掩蓋掉其中一顆其實只是剛好
-    擦過門檻。合成公式屬於 geometry 層，這個欄位只負責攜帶結果。
-    """
+    left_eye: Point3D | None = None
+    right_eye: Point3D | None = None
+    """反投影後的三維眼睛位置；`distance_m` 為 None 時這兩欄也是 None。"""
 
     def __post_init__(self) -> None:
-        if self.distance_px < 0.0:
-            raise ValueError(f"像素距離不可為負：{self.distance_px}")
-        if not 0.0 <= self.confidence <= 1.0:
-            raise ValueError(f"confidence 必須落在 0..1，收到 {self.confidence}")
+        _validate_distance(self.distance_m, self.confidence, self.distance_px)
+        if self.distance_m is not None and (
+            self.left_eye is None or self.right_eye is None
+        ):
+            raise ValueError(
+                f"instance {self.instance_id} 有 distance_m 卻缺少三維眼睛座標；"
+                f"metric 距離必須附帶它是從哪兩個點算出來的。"
+            )
+
+    @property
+    def is_metric(self) -> bool:
+        """是否具有真實尺度的距離。False 代表只有像素距離可用。"""
+        return self.distance_m is not None
+
+    @property
+    def distance_mm(self) -> float | None:
+        return None if self.distance_m is None else self.distance_m * 1000.0
+
+    @property
+    def distance_cm(self) -> float | None:
+        return None if self.distance_m is None else self.distance_m * 100.0
+
+    @property
+    def meters_per_pixel(self) -> float | None:
+        """眼睛所在深度處的每像素實際長度，供健全性檢查用。
+
+        這個值應該與「該深度下由內參推得的像素尺度」吻合。兩者差一個數量級
+        通常代表焦距填錯，或深度圖其實是相對深度。
+        """
+        if self.distance_m is None or not self.distance_px:
+            return None
+        return self.distance_m / self.distance_px
+
+
+@dataclass(frozen=True, slots=True)
+class InterObjectEyeDistance:
+    """兩隻不同動物的眼睛之間的三維距離。
+
+    預設配對是右眼對右眼，但 `keypoint_a` / `keypoint_b` 是一般化的欄位，
+    要改成左對左或交叉配對都不必動型別——決定配哪些點是 geometry 層的事。
+
+    這組量測的精度幾乎完全由深度決定：兩隻動物可能相距數公尺，而單目
+    metric depth 的相對誤差會直接乘上那個距離。`confidence` 與
+    `distance_px` 在這裡特別重要，`depth_gap_m` 則是診斷離群值的第一站。
+    """
+
+    instance_a: int
+    label_a: str
+    keypoint_a: str
+
+    instance_b: int
+    label_b: str
+    keypoint_b: str
+
+    confidence: float
+    distance_px: float | None = None
+    """兩顆眼睛在原圖上的像素距離，不依賴深度與內參。"""
+
+    distance_m: float | None = None
+    """三維距離（公尺）。沒跑深度階段、或深度取樣失敗時為 None。"""
+
+    point_a: Point3D | None = None
+    point_b: Point3D | None = None
+
+    def __post_init__(self) -> None:
+        if self.instance_a == self.instance_b:
+            raise ValueError(
+                f"InterObjectEyeDistance 用於量測不同動物之間的距離，"
+                f"但兩端都是 instance {self.instance_a}。"
+                f"同一隻動物的雙眼間距請用 InterocularDistance。"
+            )
+        _validate_distance(self.distance_m, self.confidence, self.distance_px)
+        if self.distance_m is not None and (
+            self.point_a is None or self.point_b is None
+        ):
+            raise ValueError(
+                f"instance {self.instance_a}/{self.instance_b} 有 distance_m "
+                f"卻缺少三維座標；metric 距離必須附帶它是從哪兩個點算出來的。"
+            )
+
+    @property
+    def is_metric(self) -> bool:
+        return self.distance_m is not None
+
+    @property
+    def is_cross_species(self) -> bool:
+        """兩端是否為不同物種。"""
+        return self.label_a != self.label_b
+
+    @property
+    def distance_mm(self) -> float | None:
+        return None if self.distance_m is None else self.distance_m * 1000.0
+
+    @property
+    def distance_cm(self) -> float | None:
+        return None if self.distance_m is None else self.distance_m * 100.0
+
+    @property
+    def instance_pair(self) -> tuple[int, int]:
+        """兩個 instance id，經排序，方便當作查表的 key。"""
+        return (
+            min(self.instance_a, self.instance_b),
+            max(self.instance_a, self.instance_b),
+        )
+
+    @property
+    def depth_gap_m(self) -> float | None:
+        """兩顆眼睛沿光軸的深度差；非 metric 時為 None。
+
+        這個值遠大於零時，該筆量測基本上是在量「深度差」而不是「橫向距離」，
+        其誤差會由深度模型的相對誤差主導。診斷離群值時先看這一欄。
+        """
+        if self.point_a is None or self.point_b is None:
+            return None
+        return abs(self.point_a.z - self.point_b.z)
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,18 +187,25 @@ class MeasurementResult:
     """單一影格上的全部量測結果。"""
 
     interocular: tuple[InterocularDistance, ...] = ()
-    """每隻動物的雙眼間距。沒有任何動物湊齊雙眼時為空。"""
+    """每隻動物的雙眼間距。"""
+
+    inter_object: tuple[InterObjectEyeDistance, ...] = ()
+    """跨動物的眼對眼距離。"""
 
     @property
     def is_empty(self) -> bool:
-        return not self.interocular
+        return not self.interocular and not self.inter_object
 
     @property
     def total(self) -> int:
-        return len(self.interocular)
+        """兩類量測的總筆數。"""
+        return len(self.interocular) + len(self.inter_object)
 
     def for_instance(self, instance_id: int) -> InterocularDistance | None:
-        """取指定動物的雙眼間距，不存在時回傳 None。"""
+        """取指定動物的雙眼間距，不存在時回傳 None。
+
+        每隻動物最多一組——牠只有一對眼睛。
+        """
         for d in self.interocular:
             if d.instance_id == instance_id:
                 return d
@@ -94,12 +219,35 @@ class MeasurementResult:
         """
         return tuple(d for d in self.interocular if d.label == label)
 
-    def with_min_confidence(self, threshold: float) -> MeasurementResult:
-        """濾掉信心低於門檻的量測。
+    def between(
+        self, instance_a: int, instance_b: int
+    ) -> tuple[InterObjectEyeDistance, ...]:
+        """取兩隻指定動物之間的所有跨物體量測，與傳入順序無關。"""
+        key = (min(instance_a, instance_b), max(instance_a, instance_b))
+        return tuple(d for d in self.inter_object if d.instance_pair == key)
 
-        刻意不在產生量測時就濾——「這次量不準」本身是重要資訊，尤其鳥類
-        是已知失效類別。門檻留給呼叫端自己設。
-        """
+    def cross_species(self) -> tuple[InterObjectEyeDistance, ...]:
+        """只取兩端物種不同的跨物體量測。"""
+        return tuple(d for d in self.inter_object if d.is_cross_species)
+
+    def with_min_confidence(self, threshold: float) -> MeasurementResult:
+        """兩類量測一併濾掉信心低於門檻者。"""
         return MeasurementResult(
-            tuple(d for d in self.interocular if d.confidence >= threshold)
+            tuple(d for d in self.interocular if d.confidence >= threshold),
+            tuple(d for d in self.inter_object if d.confidence >= threshold),
         )
+
+
+def _validate_distance(
+    distance_m: float | None, confidence: float, distance_px: float | None
+) -> None:
+    if distance_m is None and distance_px is None:
+        raise ValueError(
+            "一筆量測至少要有一種距離；distance_m 與 distance_px 不可同時為 None。"
+        )
+    if distance_m is not None and distance_m < 0.0:
+        raise ValueError(f"距離不可為負：{distance_m}")
+    if distance_px is not None and distance_px < 0.0:
+        raise ValueError(f"像素距離不可為負：{distance_px}")
+    if not 0.0 <= confidence <= 1.0:
+        raise ValueError(f"confidence 必須落在 0..1，收到 {confidence}")
