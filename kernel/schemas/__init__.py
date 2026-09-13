@@ -4,15 +4,28 @@
 座標系約定死，上層才不必在每個交界重新確認一次格式。這個 package 不做
 任何運算，只定義「資料長什麼樣子」。
 
-目前只有 stage 1（segmentation），所以契約也只涵蓋 bbox 與 mask。
+目前涵蓋 stage 1（bbox、mask）與 stage 2（keypoint）。
 """
 
 from kernel.schemas.frames import CoordinateFrame
-from kernel.schemas.instance import BBox, Instance, InstanceMask
+from kernel.schemas.instance import (
+    LEFT_EYE,
+    RIGHT_EYE,
+    BBox,
+    Instance,
+    InstanceMask,
+    Keypoint,
+)
+from kernel.schemas.points import FrameMismatchError, Point2D
 
 __all__ = [
+    "LEFT_EYE",
+    "RIGHT_EYE",
     "BBox",
     "CoordinateFrame",
+    "FrameMismatchError",
     "Instance",
     "InstanceMask",
+    "Keypoint",
+    "Point2D",
 ]

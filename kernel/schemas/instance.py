@@ -1,13 +1,14 @@
-"""偵測到的物體實例，以及組成它的 bbox 與 mask。
+"""偵測到的物體實例，以及組成它的 bbox / mask / keypoint。
 
 這些型別採「漸進填充」設計：pipeline 每跑完一個 stage，就用 `with_*` 方法
 產生一個帶有新資訊的新物件（全部 frozen，不就地修改）。這樣任一階段的
 中間結果都可以留下來除錯，而且不會有某個模組偷改到別人資料的問題。
 
-    seg → Instance(bbox, mask)
+    seg      → Instance(bbox, mask)
+    keypoint → instance.with_keypoints(...)
 
-目前只有 stage 1，所以 Instance 身上只掛得住 bbox 與 mask；keypoint 與
-depth 的欄位等那兩個階段進來再加。
+目前到 stage 2 為止，所以 Keypoint 身上只有二維座標與分數；深度與三維位置
+等 depth 那個階段進來再加。
 """
 
 from __future__ import annotations
@@ -17,6 +18,12 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 from kernel.schemas.frames import CoordinateFrame
+from kernel.schemas.points import Point2D
+
+#: 本專案所關心的兩個 keypoint 名稱。keypoint schema 本身是可設定的，這兩個
+#: 常數只是讓上層有個穩定的名字可以指名，不必跟著模型的標籤字串走。
+LEFT_EYE = "left_eye"
+RIGHT_EYE = "right_eye"
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +62,9 @@ class BBox:
 
     def as_xyxy(self) -> tuple[float, float, float, float]:
         return (self.x1, self.y1, self.x2, self.y2)
+
+    def as_xywh(self) -> tuple[float, float, float, float]:
+        return (self.x1, self.y1, self.width, self.height)
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -110,6 +120,13 @@ class InstanceMask:
 
 
 @dataclass(frozen=True, slots=True)
+class Keypoint:
+    name: str
+    point: Point2D
+    score: float
+
+
+@dataclass(frozen=True, slots=True)
 class Instance:
     """一個被偵測到的物體，以及掛在它身上的所有資訊。"""
 
@@ -118,6 +135,23 @@ class Instance:
     score: float
     bbox: BBox
     mask: InstanceMask | None = None
+    keypoints: tuple[Keypoint, ...] = ()
+
+    def keypoint(self, name: str) -> Keypoint | None:
+        """依名稱取 keypoint，不存在時回傳 None。"""
+        for kp in self.keypoints:
+            if kp.name == name:
+                return kp
+        return None
+
+    @property
+    def eyes(self) -> tuple[Keypoint, ...]:
+        """已定位到的雙眼，依左右順序回傳（缺一則只回傳存在的那個）。"""
+        found = (self.keypoint(LEFT_EYE), self.keypoint(RIGHT_EYE))
+        return tuple(kp for kp in found if kp is not None)
 
     def with_mask(self, mask: InstanceMask) -> Instance:
         return replace(self, mask=mask)
+
+    def with_keypoints(self, keypoints: tuple[Keypoint, ...]) -> Instance:
+        return replace(self, keypoints=tuple(keypoints))

@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from kernel.core import InterocularCore, Scene
+from kernel.models.keypoint import ViTPoseEyes
 from kernel.models.segmentation import AnimalSegmenter
 from kernel.visualization import render_scene
 
@@ -55,10 +56,17 @@ def collect_images(paths: list[str], limit: int | None) -> list[Path]:
 
 def build_core(args: argparse.Namespace) -> InterocularCore:
     """依命令列參數組出 pipeline。模型在這裡只建構，權重要到第一次推論才載入。"""
+    eyes = None
+    if not args.no_eyes:
+        eyes = ViTPoseEyes(
+            model=args.eye_model, min_score=args.min_score, device=args.device
+        )
+
     return InterocularCore(
         segmenter=AnimalSegmenter(
             weights=args.weights, conf=args.conf, device=args.device
         ),
+        eyes=eyes,
     )
 
 
@@ -66,11 +74,15 @@ def format_scene(scene: Scene) -> str:
     """把一個 Scene 排成人看得懂的區塊。"""
     name = scene.source.name if scene.source else "<image>"
     height, width = scene.image_size
-    lines = [f"{name}  {width}x{height}  {scene.n_instances} 隻動物"]
+    lines = [
+        f"{name}  {width}x{height}  "
+        f"{scene.n_instances} 隻動物 / {scene.n_eyes} 顆眼睛"
+    ]
 
     for inst in scene.instances:
+        eyes = ", ".join(f"{kp.name}={kp.score:.2f}" for kp in inst.eyes) or "無眼睛"
         lines.append(
-            f"  #{inst.instance_id} {inst.label:<9} conf={inst.score:.2f}"
+            f"  #{inst.instance_id} {inst.label:<9} conf={inst.score:.2f}  {eyes}"
         )
 
     if not scene.instances:
@@ -91,6 +103,14 @@ def scene_to_dict(scene: Scene) -> dict:
                 "label": inst.label,
                 "score": inst.score,
                 "bbox_xyxy": list(inst.bbox.as_xyxy()),
+                "eyes": {
+                    kp.name: {
+                        "x": kp.point.u,
+                        "y": kp.point.v,
+                        "score": kp.score,
+                    }
+                    for kp in inst.eyes
+                },
             }
             for inst in scene.instances
         ],
@@ -112,6 +132,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     stage1 = parser.add_argument_group("stage 1：切割")
     stage1.add_argument("--weights", default="yolo11l-seg.pt", help="YOLO*-seg 權重")
     stage1.add_argument("--conf", type=float, default=0.5, help="偵測信心門檻")
+
+    stage2 = parser.add_argument_group("stage 2：眼睛")
+    stage2.add_argument("--no-eyes", action="store_true", help="只做切割，不找眼睛")
+    stage2.add_argument(
+        "--eye-model", default="usyd-community/vitpose-plus-base", help="ViTPose 權重"
+    )
+    stage2.add_argument(
+        "--min-score",
+        type=float,
+        default=0.3,
+        help="眼睛信心門檻。調低會讓側臉動物拿到被遮住的那顆眼睛，"
+        "座標是憑空捏的",
+    )
 
     out = parser.add_argument_group("輸出")
     out.add_argument(
@@ -179,7 +212,8 @@ def main(argv: list[str] | None = None) -> int:
         print()
 
     total_instances = sum(s.n_instances for s in scenes)
-    print(f"合計：{total_instances} 隻動物")
+    total_eyes = sum(s.n_eyes for s in scenes)
+    print(f"合計：{total_instances} 隻動物，{total_eyes} 顆眼睛")
     if outdir:
         print(f"疊圖：{rendered} 張，寫入 {outdir}/")
 
@@ -200,6 +234,7 @@ if __name__ == "__main__":
     uv run main.py                          # 跑 testsample/ 底下全部圖片
     uv run main.py path/to/cat.jpg          # 跑單張
     uv run main.py imgs/ --limit 5          # 跑資料夾的前 5 張
+    uv run main.py --no-eyes                # 只切割，不找眼睛
     uv run main.py --no-save                # 只印，不寫檔
 
     不給圖片路徑時就跑 :data:`DEFAULT_IMAGE_DIR`。
@@ -209,13 +244,15 @@ if __name__ == "__main__":
         output/
         ├── results.json                完整結果
         ├── 000000000285_1_masks.jpg
+        ├── 000000000285_2_eyes.jpg
         └── 000000020247_1_masks.jpg
 
     預設存檔是刻意的：這條 pipeline 的失效幾乎都是靜默的，跑的當下留下查驗用的
     圖，比事後起疑再回頭重跑一次划算得多。用 ``--outdir`` 換目錄、``--no-save``
     完全關掉。
 
-    目前只跑 stage 1（切割），輸出每隻動物的輪廓
+    預設跑 stage 1 + 2（切割 + 眼睛），輸出每隻動物的輪廓與雙眼位置。
+    ``--no-eyes`` 只跑切割，此時不會產生 2_eyes.jpg。
     """
 
     raise SystemExit(main())

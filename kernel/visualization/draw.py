@@ -1,13 +1,20 @@
 """每個 stage 一張疊圖，供人工查驗。
 
     output/
-    └── 000000000285_1_masks.jpg    輪廓疊色 + bbox + 物種標籤
+    ├── 000000000285_1_masks.jpg    輪廓疊色 + bbox + 物種標籤
+    └── 000000000285_2_eyes.jpg     疊在 1 之上，加上眼睛位置與分數
 
 這條 pipeline 上的失效幾乎都是**靜默**的——不丟例外、數值看起來也合理，
-只是錯的。以 stage 1 來說，就是多邊形柵格化歪掉、或錯把背景納入輪廓。
-所以疊圖在這個專案不是加分項，而是主要的除錯手段。
+只是錯的：
 
-之後的 stage 會層層疊上去（眼睛畫在輪廓之上），這樣才看得出「這顆眼睛屬於
+    stage 1   多邊形柵格化歪掉、錯把背景納入輪廓
+    stage 2   關鍵點索引錯位（鼻子被當成眼睛）、側臉時抓到被遮住的那顆眼
+
+其中關鍵點索引錯位那次，就是靠肉眼看疊圖才抓到的（見
+:mod:`kernel.models.keypoint` 模組開頭）。所以疊圖在這個專案不是加分項，
+而是主要的除錯手段。
+
+圖是層層疊上去的：stage 2 畫在 stage 1 之上，這樣才看得出「這顆眼睛屬於
 哪一塊輪廓」。同一隻動物在各張圖上顏色固定，方便交叉比對。
 
 所有繪圖都在 **RGB** 空間進行，只有 :func:`save` 會轉成 BGR——cv2 只有在
@@ -28,9 +35,10 @@ from kernel.visualization.palette import color_for, contrast_color
 MASK_ALPHA = 0.40
 STAGE_FILENAMES = {
     1: "1_masks.jpg",
+    2: "2_eyes.jpg",
 }
 
-ALL_STAGES = (1,)
+ALL_STAGES = (1, 2)
 
 
 def render_scene(
@@ -44,14 +52,15 @@ def render_scene(
     檔名是 ``<原始檔名>_<stage>.jpg``，不另開子目錄——一張圖最多幾個 stage，
     為此各建一個資料夾只是讓人多點幾層才看得到圖。
 
-    renderer 回傳 None 代表這個 stage 沒有資料可畫，跳過而不是報錯——分段
-    降級的原則在這裡同樣適用。
+    renderer 回傳 None 代表這個 stage 沒有資料可畫（例如沒跑 stage 2，或跑了
+    但一顆眼睛都沒過門檻），跳過而不是報錯——分段降級的原則在這裡同樣適用。
     """
     stem = scene.source.stem if scene.source else "scene"
     outdir.mkdir(parents=True, exist_ok=True)
 
     renderers = {
         1: draw_masks,
+        2: draw_eyes,
     }
 
     written: list[Path] = []
@@ -110,6 +119,44 @@ def draw_masks(
             color,
             image,
         )
+
+    return canvas
+
+
+# -- stage 2：眼睛 ----------------------------------------------------------
+
+
+def draw_eyes(image: np.ndarray, scene: Scene) -> np.ndarray | None:
+    """在 stage 1 之上標出眼睛。沒有任何眼睛時回傳 None。
+
+    疊在輪廓上而不是畫在原圖，是為了讓「這顆眼睛屬於哪隻動物」一眼看得出來
+    ——歸屬配錯是這一層最典型的失效。
+
+    十字準星的中心是關鍵點的真實子像素位置。畫圓圈的話中心會被圓心取整
+    掩蓋掉，而子像素精度直接影響最終的距離誤差。
+    """
+    if scene.n_eyes == 0:
+        return None
+
+    label = LabelPlacer()
+    canvas = draw_masks(image, scene, label)
+    thickness = _line_thickness(image)
+    arm = max(6, int(_scale(image) * 8))
+
+    for inst in scene.instances:
+        color = color_for(inst.instance_id)
+        for kp in inst.eyes:
+            u, v = int(round(kp.point.u)), int(round(kp.point.v))
+            cv2.line(canvas, (u - arm, v), (u + arm, v), color, thickness, cv2.LINE_AA)
+            cv2.line(canvas, (u, v - arm), (u, v + arm), color, thickness, cv2.LINE_AA)
+            cv2.circle(canvas, (u, v), arm // 2, color, thickness, cv2.LINE_AA)
+            label(
+                canvas,
+                f"#{inst.instance_id} {kp.name} {kp.score:.2f}",
+                (u + arm, v + arm),
+                color,
+                image,
+            )
 
     return canvas
 

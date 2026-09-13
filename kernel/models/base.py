@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Protocol, Sequence, runtime_checkable
 
 import numpy as np
+import torch
 
 from kernel.schemas import Instance
 
@@ -38,6 +39,13 @@ def validate_image(image: np.ndarray) -> np.ndarray:
     return image
 
 
+def resolve_device(device: str | None) -> str:
+    """把 None 解析成實際可用的裝置。"""
+    if device is not None:
+        return device
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 @runtime_checkable
 class Segmenter(Protocol):
     """Stage 1：把影像切成一個個物體。"""
@@ -51,5 +59,28 @@ class Segmenter(Protocol):
         `image` 為 HxWx3 uint8 RGB。回傳的 `Instance` 必須已帶 bbox 與 mask，
         且座標一律在 ``CoordinateFrame.IMAGE``——把模型輸入座標換算回原圖是
         實作自己的責任，外界不需要知道它內部縮放到多大。
+        """
+        ...
+
+
+@runtime_checkable
+class EyeDetector(Protocol):
+    """Stage 2：在既有的物體上找出眼睛。"""
+
+    name: str
+
+    def detect(
+        self, image: np.ndarray, instances: Sequence[Instance]
+    ) -> Sequence[Instance]:
+        """回傳掛上眼睛 keypoint 的 instances。
+
+        回傳的序列**必須與傳入的 instances 一一對應且順序相同**，沒偵測到
+        眼睛的那些則原樣回傳。這樣呼叫端不需要另外做歸屬比對。
+
+        眼睛與物體的歸屬關係是結構性的——keypoint 直接掛在它所屬的
+        `Instance` 上。top-down 模型本來就知道每顆關鍵點是從哪個框推論出來
+        的，這個資訊不應該在回傳時被攤平掉；一旦攤平就只能靠框中心距離
+        重新猜，而兩隻動物的框一重疊就會猜錯（眼睛在框的頂端，比的卻是框
+        中心，體型大的那隻會把鄰居的眼睛整組搶走）。
         """
         ...

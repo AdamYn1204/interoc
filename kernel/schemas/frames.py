@@ -4,8 +4,9 @@
 完全不同的座標系，而它們長得一模一樣。把座標系當成型別的一部分帶著走，
 才能在組裝階段就把「拿模型輸入座標去查原圖」這類錯誤擋下來。
 
-目前只有 stage 1，所以只定義原圖與模型輸入兩個座標系。CROP（top-down
-keypoint 的裁切區）與 CAMERA（三維）要等後面兩個階段進來才有意義。
+目前只定義原圖與模型輸入兩個座標系。stage 2 雖然是 top-down、實際上會裁切，
+但 ViTPose 的 processor 已經把座標換算回原圖才回傳，CROP 不會外流到這一層，
+所以先不定義；CAMERA（三維）則要等 depth 那個階段進來才有意義。
 """
 
 from __future__ import annotations
