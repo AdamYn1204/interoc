@@ -130,6 +130,19 @@ class Keypoint:
     score: float
     """keypoint 模型的定位信心，0..1。與深度好壞無關。"""
 
+    observed: bool = True
+    """這顆點是**看到的**，還是模型憑空補的。
+
+    top-down 姿態模型會無條件吐滿全部關鍵點——側臉時被頭擋住的那顆眼睛
+    照樣有一組座標，數值看起來完全正常。分數低於門檻的就是這種，本專案
+    稱為「虛擬」的點。
+
+    這種點會被留下來而不是丟掉：「這隻動物有一顆眼睛是捏的」本身就是結果，
+    丟掉之後下游只看得到「只有一顆眼睛」，分不出原因是側臉、出框、還是
+    模型整組失效。但它**不可以進入任何距離計算**，那由
+    :func:`kernel.geometry` 把關。
+    """
+
     depth: float | None = None
     """沿光軸的距離（公尺）。沒跑 depth、或取樣失敗時為 None。"""
 
@@ -186,9 +199,23 @@ class Instance:
 
     @property
     def eyes(self) -> tuple[Keypoint, ...]:
-        """已定位到的雙眼，依左右順序回傳（缺一則只回傳存在的那個）。"""
+        """**看到的**雙眼，依左右順序回傳（缺一則只回傳存在的那個）。
+
+        虛擬眼（`observed=False`）不在這裡。疊圖、終端機摘要與所有量測都走
+        這個屬性，所以預設行為維持「只相信看到的點」；要看被補出來的那些
+        請用 :attr:`inferred_eyes`。
+        """
         found = (self.keypoint(LEFT_EYE), self.keypoint(RIGHT_EYE))
-        return tuple(kp for kp in found if kp is not None)
+        return tuple(kp for kp in found if kp is not None and kp.observed)
+
+    @property
+    def inferred_eyes(self) -> tuple[Keypoint, ...]:
+        """模型補出來、但分數沒過門檻的眼睛。
+
+        典型情況是側臉：被頭擋住的那顆眼睛照樣有座標，只是那組座標是捏的。
+        """
+        found = (self.keypoint(LEFT_EYE), self.keypoint(RIGHT_EYE))
+        return tuple(kp for kp in found if kp is not None and not kp.observed)
 
     def with_mask(self, mask: InstanceMask) -> Instance:
         return replace(self, mask=mask)

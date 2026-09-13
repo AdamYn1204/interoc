@@ -239,9 +239,15 @@ def _inter_object(
 def _usable(a: Keypoint, b: Keypoint) -> bool:
     """兩顆 keypoint 是否足以產生一筆量測。
 
+    虛擬點（`observed=False`）一律略過：那組座標是模型在看不到的地方捏的，
+    拿去算距離會得到一個看起來合理、實際上完全錯的數字——對側臉動物來說
+    比量不到嚴重得多。
+
     座標系不符直接拋錯而不是略過：那是組裝錯誤，不是資料問題。非有限值
     則略過——模型失敗時會吐 nan，而 nan 在後續的平均與比較裡是靜默傳染的。
     """
+    if not (a.observed and b.observed):
+        return False
     for kp in (a, b):
         kp.point.require_frame(CoordinateFrame.IMAGE)
     return a.point.is_finite and b.point.is_finite

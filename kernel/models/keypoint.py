@@ -77,8 +77,11 @@ class ViTPoseEyes:
     權重在第一次 :meth:`detect` 時才載入，建構本身不吃 VRAM。
 
     ``min_score`` 是**必要**的，不是可選的調校項：top-down 模型會無條件吐出
-    全部 17 個關鍵點，側臉時被遮住的那顆眼睛照樣有座標。不過濾的話每隻動物
+    全部 17 個關鍵點，側臉時被遮住的那顆眼睛照樣有座標。不區分的話每隻動物
     都會拿到兩顆眼睛，看起來合理、實際上有一顆是憑空捏的——比漏檢嚴重得多。
+
+    沒過門檻的眼睛**不會被丟掉**，而是標成 ``observed=False``（虛擬眼）留在
+    instance 上：報告需要回答「這顆是不是虛擬的」。它們不參與距離計算。
     """
 
     def __init__(
@@ -160,14 +163,17 @@ class ViTPoseEyes:
             eyes: list[Keypoint] = []
             for index, name in EYE_KEYPOINTS.items():
                 score = float(scores[index])
-                if score < self.min_score:
-                    continue
                 x, y = (float(v) for v in keypoints[index][:2])
+                # 沒過門檻的眼睛**留下來並標記**，而不是丟掉。丟掉的話下游只
+                # 看得到「少一顆眼睛」，分不出是側臉被擋住、出框、還是模型整組
+                # 失效；報告要回答「這顆是不是虛擬的」，就得保留這個證據。
+                # 距離計算由 kernel.geometry 擋掉 observed=False 的點。
                 eyes.append(
                     Keypoint(
                         name=name,
                         point=Point2D(x, y, CoordinateFrame.IMAGE),
                         score=score,
+                        observed=score >= self.min_score,
                     )
                 )
             enriched.append(instance.with_keypoints(tuple(eyes)))

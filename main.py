@@ -20,6 +20,14 @@ from kernel.models.depth import (
 )
 from kernel.models.keypoint import ViTPoseEyes
 from kernel.models.segmentation import AnimalSegmenter
+from kernel.report import (
+    ANIMAL_COLUMNS,
+    PAIR_COLUMNS,
+    animal_rows,
+    build_report,
+    pair_rows,
+    write_csv,
+)
 from kernel.schemas import LEFT_EYE, RIGHT_EYE
 from kernel.visualization import render_scene
 
@@ -29,8 +37,15 @@ DEFAULT_IMAGE_DIR = Path("testsample")
 #: 幾乎都是靜默的，預設就把查驗用的圖留下來，比事後想查才回頭重跑划算。
 DEFAULT_OUTPUT_DIR = Path("output")
 
-#: 完整結果的檔名，寫在輸出目錄底下。
+#: 完整結果的檔名，寫在輸出目錄底下。給程式讀。
 RESULTS_FILENAME = "results.json"
+
+#: 給人讀的報告，與 results.json 同源，但替每筆數字下了判斷（見 kernel.report）。
+REPORT_FILENAME = "report.md"
+
+#: 報告兩張表的 CSV 版，給試算表篩選用。判定與備註和 report.md 同源。
+ANIMALS_CSV_FILENAME = "report_animals.csv"
+PAIRS_CSV_FILENAME = "report_pairs.csv"
 
 IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".webp"})
 
@@ -171,13 +186,17 @@ def scene_to_dict(scene: Scene) -> dict:
             "label": inst.label,
             "score": inst.score,
             "bbox_xyxy": list(inst.bbox.as_xyxy()),
+            # 虛擬眼也寫進來並標 observed=false：JSON 是完整紀錄，丟掉的話
+            # 事後就無從判斷「只有一顆眼睛」是側臉還是模型整組失效。
             "eyes": {
                 kp.name: {
                     "x": kp.point.u,
                     "y": kp.point.v,
                     "score": kp.score,
+                    "observed": kp.observed,
+                    "depth_m": kp.depth,
                 }
-                for kp in inst.eyes
+                for kp in (*inst.eyes, *inst.inferred_eyes)
             },
             "interocular": (
                 None
@@ -391,6 +410,23 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"結果：{json_path}")
 
+        # 報告跟著 JSON 走：--no-save 時兩者都不寫，--json 換路徑時報告落在同一個
+        # 目錄，兩份同源的檔案才不會被拆散。
+        report_path = json_path.parent / REPORT_FILENAME
+        report_path.write_text(
+            build_report(
+                scenes, min_score=args.min_score, cross_keypoint=args.cross_eye
+            ),
+            encoding="utf-8",
+        )
+        print(f"報告：{report_path}")
+
+        animals_csv = json_path.parent / ANIMALS_CSV_FILENAME
+        pairs_csv = json_path.parent / PAIRS_CSV_FILENAME
+        write_csv(animals_csv, animal_rows(scenes), ANIMAL_COLUMNS)
+        write_csv(pairs_csv, pair_rows(scenes, args.cross_eye), PAIR_COLUMNS)
+        print(f"CSV：{animals_csv}、{pairs_csv}")
+
     return 0
 
 
@@ -411,6 +447,9 @@ if __name__ == "__main__":
 
         output/
         ├── results.json                完整結果
+        ├── report.md                   給人讀的報告
+        ├── report_animals.csv          報告的「每隻動物」表
+        ├── report_pairs.csv            報告的「任兩隻動物」表
         ├── 000000000285_1_masks.jpg
         ├── 000000000285_2_eyes.jpg
         ├── 000000000285_3_depth.jpg
